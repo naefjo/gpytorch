@@ -3,6 +3,8 @@
 import warnings
 from copy import deepcopy
 
+from time import perf_counter
+
 import torch
 
 from .. import settings
@@ -162,6 +164,11 @@ class ExactGP(GP):
 
         model_batch_shape = self.train_inputs[0].shape[:-2]
 
+        data_selector = None
+        if "data_selector" in kwargs:
+            data_selector = kwargs["data_selector"]
+            data_selector_tsr = torch.diag(data_selector)[torch.nonzero(data_selector).squeeze(), :]
+
         if not isinstance(inputs, list):
             inputs = [inputs]
 
@@ -201,6 +208,9 @@ class ExactGP(GP):
         # size of the fantasy model here - this is done below, after the evaluation and fast fantasy update
         train_inputs = [tin.expand(input_batch_shape + tin.shape[-2:]) for tin in self.train_inputs]
         train_targets = self.train_targets.expand(target_batch_shape + self.train_targets.shape[data_dim_start:])
+        if data_selector is not None:
+            train_inputs = [data_selector_tsr @ train_input for train_input in train_inputs]
+            train_targets = data_selector_tsr @ train_targets
 
         full_inputs = [
             torch.cat(
@@ -213,14 +223,21 @@ class ExactGP(GP):
             [train_targets, targets.expand(target_batch_shape + targets.shape[data_dim_start:])], dim=data_dim_start
         )
 
+        fantasy_kwargs = {}
         try:
-            fantasy_kwargs = {"noise": kwargs.pop("noise")}
+            fantasy_kwargs["noise"] = kwargs.pop("noise")
         except KeyError:
-            fantasy_kwargs = {}
+            pass
+
+        try:
+            fantasy_kwargs["data_selector"] = kwargs.pop("data_selector")
+        except KeyError:
+            pass
 
         full_output = super(ExactGP, self).__call__(*full_inputs, **kwargs)
 
         # Copy model without copying training data or prediction strategy (since we'll overwrite those)
+        # NOTE(@naefjo): dont need to change here since we discard the old object
         old_pred_strat = self.prediction_strategy
         old_train_inputs = self.train_inputs
         old_train_targets = self.train_targets
@@ -235,10 +252,14 @@ class ExactGP(GP):
         self.train_targets = old_train_targets
         self.likelihood = old_likelihood
 
-        new_model.likelihood = old_likelihood.get_fantasy_likelihood(**fantasy_kwargs)
+        new_likelihood = old_likelihood.get_fantasy_likelihood(**fantasy_kwargs)
+        new_model.likelihood = new_likelihood
+
+        time_before_gfs = perf_counter()
         new_model.prediction_strategy = old_pred_strat.get_fantasy_strategy(
-            inputs, targets, full_inputs, full_targets, full_output, **fantasy_kwargs
+            inputs, targets, full_inputs, full_targets, full_output, new_likelihood, **fantasy_kwargs
         )
+        print(f"gfs time: {1e3*(perf_counter() - time_before_gfs)}")
 
         # if the fantasies are at the same points, we need to expand the inputs for the new model
         if tbdim == ibdim + 1:

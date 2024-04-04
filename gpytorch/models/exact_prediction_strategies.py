@@ -4,6 +4,8 @@ import functools
 import string
 import warnings
 
+from time import perf_counter
+
 import torch
 from linear_operator import to_dense, to_linear_operator
 from linear_operator.operators import (
@@ -16,6 +18,7 @@ from linear_operator.operators import (
     MaskedLinearOperator,
     MatmulLinearOperator,
     RootLinearOperator,
+    TriangularLinearOperator,
     ZeroLinearOperator,
 )
 from linear_operator.utils.cholesky import psd_safe_cholesky
@@ -100,6 +103,11 @@ class DefaultPredictionStrategy(object):
 
         return res
 
+    def _alternative_computation(self, L, train_test_covar):
+        if not isinstance(train_test_covar, torch.Tensor):
+            train_test_covar = train_test_covar.to_dense()
+        return L.solve(train_test_covar)
+
     def _exact_predictive_covar_inv_quad_form_root(self, precomputed_cache, test_train_covar):
         r"""
         Computes :math:`K_{X^{*}X} S` given a precomputed cache
@@ -116,7 +124,7 @@ class DefaultPredictionStrategy(object):
         # where S S^T = (K_XX + sigma^2 I)^-1
         return test_train_covar.matmul(precomputed_cache)
 
-    def get_fantasy_strategy(self, inputs, targets, full_inputs, full_targets, full_output, **kwargs):
+    def get_fantasy_strategy(self, inputs, targets, full_inputs, full_targets, full_output, fant_likelihood, **kwargs):
         """
         Returns a new PredictionStrategy that incorporates the specified inputs and targets as new training data.
 
@@ -137,6 +145,17 @@ class DefaultPredictionStrategy(object):
             A `DefaultPredictionStrategy` model with `n + m` training examples, where the `m` fantasy examples have
             been added and all test-time caches have been updated.
         """
+
+        mean_cache = self.mean_cache
+
+        if "data_selector" in kwargs:
+            data_selector = kwargs["data_selector"]
+            self._train_shape = torch.Size((data_selector.sum().int().item(), self._train_shape[-1]))
+
+            time_before_ds = perf_counter()
+            print(f"ds time: {1e3*(perf_counter() - time_before_ds)}")
+
+        time_before_evals = perf_counter()
         if not isinstance(full_output, MultitaskMultivariateNormal):
             target_batch_shape = targets.shape[:-1]
         else:
@@ -157,18 +176,32 @@ class DefaultPredictionStrategy(object):
             full_mean = full_mean.view(*batch_shape, -1)
             fant_mean = full_mean[..., num_train:]
 
+        # NOTE(@naefjo): this evaluates K_XX + simga^2*I. full_covar is only K_XX
         # Evaluate fant x train and fant x fant covariance matrices, leave train x train unevaluated.
         fant_fant_covar = full_covar[..., num_train:, num_train:]
         mvn = self.train_prior_dist.__class__(fant_mean, fant_fant_covar)
-        fant_likelihood = self.likelihood.get_fantasy_likelihood(**kwargs)
         mvn_obs = fant_likelihood(mvn, inputs, **kwargs)
 
         fant_fant_covar = mvn_obs.covariance_matrix
-        fant_train_covar = to_dense(full_covar[..., num_train:, :num_train])
+        lazy_fant_fant_covar = mvn_obs.lazy_covariance_matrix
+        fant_train_covar = full_covar[..., num_train:, :num_train]
+        print(f"eval times: {1e3 *(perf_counter() - time_before_evals)}")
 
-        self.fantasy_inputs = inputs
-        self.fantasy_targets = targets
+        if "data_selector" in kwargs:
+            time_before_rrr = perf_counter()
+            self.lik_train_train_covar = self.lik_train_train_covar.remove_root_rows(
+                data_selector, self.train_shape[-1]
+            )
 
+            print(f"rrr time: {1e3*(perf_counter() - time_before_rrr)}")
+            time_before_mean_cache_trsolve = perf_counter()
+            # NOTE(@naefjo): Couldn't get this to work nicely with linear_operator.
+            # It never seemd to recognize that there is already a cholesky decomposition
+            # in cache and recomputes it...
+            mean_cache = torch.cholesky_solve(
+                full_targets[:num_train].unsqueeze(-1), self.lik_train_train_covar.root_decomposition().root.to_dense()
+            ).T
+            print(f"mctrisolve: {1e3*(perf_counter() - time_before_mean_cache_trsolve)}")
         r"""
         Compute a new mean cache given the old mean cache.
 
@@ -180,18 +213,21 @@ class DefaultPredictionStrategy(object):
             [S - U'Q]b = y_f - U'\alpha   ==> b = [S - U'Q]^{-1}(y_f - U'\alpha)
             a = \alpha - Qb
         """
-        # Get cached K inverse decomp. (or compute if we somehow don't already have the covariance cache)
-        K_inverse = self.lik_train_train_covar.root_inv_decomposition()
-        fant_solve = K_inverse.matmul(fant_train_covar.transpose(-2, -1))
+        time_before_computations = perf_counter()
+        # TODO(@naefjo): dont use torch linalg solve but direct
+        K_root = self.lik_train_train_covar.root_decomposition().root
+        fant_train_covar_dense = fant_train_covar.to_dense()
+        fant_solve = torch.cholesky_solve(fant_train_covar_dense.transpose(-2, -1), K_root.to_dense())
 
         # Solve for "b", the lower portion of the *new* \\alpha corresponding to the fantasy points.
-        schur_complement = fant_fant_covar - fant_train_covar.matmul(fant_solve)
+        schur_complement = fant_fant_covar - fant_train_covar_dense.matmul(fant_solve)
 
         # we'd like to use a less hacky approach for the following, but einsum can be much faster than
         # than unsqueezing/squeezing here (esp. in backward passes), unfortunately it currenlty has some
         # issues with broadcasting: https://github.com/pytorch/pytorch/issues/15671
-        prefix = string.ascii_lowercase[: max(fant_train_covar.dim() - self.mean_cache.dim() - 1, 0)]
-        ftcm = torch.einsum(prefix + "...yz,...z->" + prefix + "...y", [fant_train_covar, self.mean_cache])
+        prefix = string.ascii_lowercase[: max(fant_train_covar_dense.dim() - mean_cache.dim() - 1, 0)]
+        # U' @ mean_cache
+        ftcm = torch.einsum(prefix + "...yz,...z->" + prefix + "...y", [fant_train_covar_dense, mean_cache])
 
         small_system_rhs = targets - fant_mean - ftcm
         small_system_rhs = small_system_rhs.unsqueeze(-1)
@@ -200,7 +236,7 @@ class DefaultPredictionStrategy(object):
         fant_cache_lower = torch.cholesky_solve(small_system_rhs, schur_cholesky)
 
         # Get "a", the new upper portion of the cache corresponding to the old training points.
-        fant_cache_upper = self.mean_cache.unsqueeze(-1) - fant_solve.matmul(fant_cache_lower)
+        fant_cache_upper = mean_cache.unsqueeze(-1) - fant_solve.matmul(fant_cache_lower)
 
         fant_cache_upper = fant_cache_upper.squeeze(-1)
         fant_cache_lower = fant_cache_lower.squeeze(-1)
@@ -208,10 +244,30 @@ class DefaultPredictionStrategy(object):
         # New mean cache.
         fant_mean_cache = torch.cat((fant_cache_upper, fant_cache_lower), dim=-1)
 
+        print(f"computation times: {1e3*(perf_counter() - time_before_computations)}")
+
         # now update the root and root inverse
-        new_lt = self.lik_train_train_covar.cat_rows(fant_train_covar, fant_fant_covar)
+        # print(f"fant train_covar: {fant_train_covar.shape}")
+        time_before_cr = perf_counter()
+        new_lt = self.lik_train_train_covar.cat_rows(fant_train_covar, lazy_fant_fant_covar, generate_inv_roots=False)
+        print(f"cr time: {1e3*(perf_counter() - time_before_cr)}")
         new_root = new_lt.root_decomposition().root
-        new_covar_cache = new_lt.root_inv_decomposition().root
+        # NOTE(@naefjo): covar_cache is inv_root we don't need it if we triangular solve instead.
+
+        # NOTE(@naefjo): The commented code is the exact mean cache if we recompute.
+        # Compare tmp_out to fant_mean_cache
+        # mvn_tmp = self.likelihood(full_output, full_inputs)
+        # tmp_train_mean, tmp_train_train_covar = mvn_tmp.loc, mvn_tmp.lazy_covariance_matrix
+        # train_labels_offset = (full_targets - tmp_train_mean).unsqueeze(-1)
+        # tmp_out = tmp_train_train_covar.evaluate_kernel().solve(train_labels_offset).squeeze(-1)
+        # print(f"ft_cov 2:\n{tmp_train_train_covar[..., num_train:, num_train:].to_dense()}")
+        # print(f"tl_off: \n{train_labels_offset.T}")
+        # print(f"fant mean cache:\n{fant_mean_cache}")
+        # print(f"recomputed mean cache:\n{tmp_out}")
+        # print(tmp_train_train_covar.to_dense())
+        # print(self.lik_train_train_covar.to_dense())
+
+        time_before_last_stuff = perf_counter()
 
         # Expand inputs accordingly if necessary (for fantasies at the same points)
         if full_inputs[0].dim() <= full_targets.dim():
@@ -230,14 +286,18 @@ class DefaultPredictionStrategy(object):
         # Create new DefaultPredictionStrategy object
         fant_strat = self.__class__(
             train_inputs=full_inputs,
-            train_prior_dist=self.train_prior_dist.__class__(full_mean, full_covar),
+            train_prior_dist=full_output,
             train_labels=full_targets,
             likelihood=fant_likelihood,
             root=new_root,
-            inv_root=new_covar_cache,
         )
-        add_to_cache(fant_strat, "mean_cache", fant_mean_cache)
-        add_to_cache(fant_strat, "covar_cache", new_covar_cache.to_dense())
+
+        if settings.detach_test_caches.on():
+            fant_mean_cache = fant_mean_cache.detach()
+
+        print(f"time before cache: {1e3*(perf_counter() -time_before_last_stuff)}")
+        add_to_cache(fant_strat, "mean_cache", fant_mean_cache, settings.observation_nan_policy.value())
+        print(f"time last stuff: {1e3*(perf_counter() -time_before_last_stuff)}")
         return fant_strat
 
     @property
@@ -404,8 +464,21 @@ class DefaultPredictionStrategy(object):
             else:
                 return test_test_covar + MatmulLinearOperator(test_train_covar, covar_correction_rhs.mul(-1))
 
-        precomputed_cache = self.covar_cache
-        covar_inv_quad_form_root = self._exact_predictive_covar_inv_quad_form_root(precomputed_cache, test_train_covar)
+        lik_train_train_covar_root = self.lik_train_train_covar.root_decomposition().root
+        if isinstance(lik_train_train_covar_root, TriangularLinearOperator):
+            covar_inv_quad_form_root = self._alternative_computation(
+                lik_train_train_covar_root, test_train_covar.transpose(-1, -2)
+            ).mT
+        else:
+            warnings.warn(
+                'Covariance root is not Triangular. Using "infefficient" covariance computation.',
+                RuntimeWarning,
+            )
+            covar_inv_quad_form_root = self._exact_predictive_covar_inv_quad_form_root(
+                self.covar_cache, test_train_covar
+            )
+            assert False
+
         if torch.is_tensor(test_test_covar):
             return to_linear_operator(
                 torch.add(

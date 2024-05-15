@@ -4,7 +4,7 @@ import functools
 import string
 import warnings
 
-from time import perf_counter
+# from time import perf_counter
 
 import torch
 from linear_operator import to_dense, to_linear_operator
@@ -152,10 +152,10 @@ class DefaultPredictionStrategy(object):
             data_selector = kwargs["data_selector"]
             self._train_shape = torch.Size((data_selector.sum().int().item(), self._train_shape[-1]))
 
-            time_before_ds = perf_counter()
-            print(f"ds time: {1e3*(perf_counter() - time_before_ds)}")
+            # time_before_ds = perf_counter()
+            # print(f"ds time: {1e3*(perf_counter() - time_before_ds)}")
 
-        time_before_evals = perf_counter()
+        # time_before_evals = perf_counter()
         if not isinstance(full_output, MultitaskMultivariateNormal):
             target_batch_shape = targets.shape[:-1]
         else:
@@ -185,23 +185,23 @@ class DefaultPredictionStrategy(object):
         fant_fant_covar = mvn_obs.covariance_matrix
         lazy_fant_fant_covar = mvn_obs.lazy_covariance_matrix
         fant_train_covar = full_covar[..., num_train:, :num_train]
-        print(f"eval times: {1e3 *(perf_counter() - time_before_evals)}")
+        # print(f"eval times: {1e3 *(perf_counter() - time_before_evals)}")
 
         if "data_selector" in kwargs:
-            time_before_rrr = perf_counter()
+            # time_before_rrr = perf_counter()
             self.lik_train_train_covar = self.lik_train_train_covar.remove_root_rows(
                 data_selector, self.train_shape[-1]
             )
 
-            print(f"rrr time: {1e3*(perf_counter() - time_before_rrr)}")
-            time_before_mean_cache_trsolve = perf_counter()
+            # print(f"rrr time: {1e3*(perf_counter() - time_before_rrr)}")
+            # time_before_mean_cache_trsolve = perf_counter()
             # NOTE(@naefjo): Couldn't get this to work nicely with linear_operator.
             # It never seemd to recognize that there is already a cholesky decomposition
             # in cache and recomputes it...
             mean_cache = torch.cholesky_solve(
                 full_targets[:num_train].unsqueeze(-1), self.lik_train_train_covar.root_decomposition().root.to_dense()
             ).T
-            print(f"mctrisolve: {1e3*(perf_counter() - time_before_mean_cache_trsolve)}")
+            # print(f"mctrisolve: {1e3*(perf_counter() - time_before_mean_cache_trsolve)}")
         r"""
         Compute a new mean cache given the old mean cache.
 
@@ -213,7 +213,7 @@ class DefaultPredictionStrategy(object):
             [S - U'Q]b = y_f - U'\alpha   ==> b = [S - U'Q]^{-1}(y_f - U'\alpha)
             a = \alpha - Qb
         """
-        time_before_computations = perf_counter()
+        # time_before_computations = perf_counter()
         # TODO(@naefjo): dont use torch linalg solve but direct
         K_root = self.lik_train_train_covar.root_decomposition().root
         fant_train_covar_dense = fant_train_covar.to_dense()
@@ -244,13 +244,13 @@ class DefaultPredictionStrategy(object):
         # New mean cache.
         fant_mean_cache = torch.cat((fant_cache_upper, fant_cache_lower), dim=-1)
 
-        print(f"computation times: {1e3*(perf_counter() - time_before_computations)}")
+        # print(f"computation times: {1e3*(perf_counter() - time_before_computations)}")
 
         # now update the root and root inverse
         # print(f"fant train_covar: {fant_train_covar.shape}")
-        time_before_cr = perf_counter()
+        # time_before_cr = perf_counter()
         new_lt = self.lik_train_train_covar.cat_rows(fant_train_covar, lazy_fant_fant_covar, generate_inv_roots=False)
-        print(f"cr time: {1e3*(perf_counter() - time_before_cr)}")
+        # print(f"cr time: {1e3*(perf_counter() - time_before_cr)}")
         new_root = new_lt.root_decomposition().root
         # NOTE(@naefjo): covar_cache is inv_root we don't need it if we triangular solve instead.
 
@@ -267,7 +267,7 @@ class DefaultPredictionStrategy(object):
         # print(tmp_train_train_covar.to_dense())
         # print(self.lik_train_train_covar.to_dense())
 
-        time_before_last_stuff = perf_counter()
+        # time_before_last_stuff = perf_counter()
 
         # Expand inputs accordingly if necessary (for fantasies at the same points)
         if full_inputs[0].dim() <= full_targets.dim():
@@ -295,9 +295,9 @@ class DefaultPredictionStrategy(object):
         if settings.detach_test_caches.on():
             fant_mean_cache = fant_mean_cache.detach()
 
-        print(f"time before cache: {1e3*(perf_counter() -time_before_last_stuff)}")
+        # print(f"time before cache: {1e3*(perf_counter() -time_before_last_stuff)}")
         add_to_cache(fant_strat, "mean_cache", fant_mean_cache, settings.observation_nan_policy.value())
-        print(f"time last stuff: {1e3*(perf_counter() -time_before_last_stuff)}")
+        # print(f"time last stuff: {1e3*(perf_counter() -time_before_last_stuff)}")
         return fant_strat
 
     @property
@@ -868,6 +868,7 @@ class SGPRPredictionStrategy(DefaultPredictionStrategy):
         train_train_covar = self.lik_train_train_covar.evaluate_kernel()
 
         # Get terms needed for woodbury
+        print(f"linop type:\n{type(train_train_covar._linear_op)}")
         root = train_train_covar._linear_op.root_decomposition().root.to_dense()  # R
         inv_diag = train_train_covar._diag_tensor.inverse()  # \sigma^{-2}
 

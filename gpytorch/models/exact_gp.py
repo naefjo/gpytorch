@@ -3,7 +3,7 @@
 import warnings
 from copy import deepcopy
 
-from time import perf_counter
+# from time import perf_counter
 
 import torch
 
@@ -255,11 +255,11 @@ class ExactGP(GP):
         new_likelihood = old_likelihood.get_fantasy_likelihood(**fantasy_kwargs)
         new_model.likelihood = new_likelihood
 
-        time_before_gfs = perf_counter()
+        # time_before_gfs = perf_counter()
         new_model.prediction_strategy = old_pred_strat.get_fantasy_strategy(
             inputs, targets, full_inputs, full_targets, full_output, new_likelihood, **fantasy_kwargs
         )
-        print(f"gfs time: {1e3*(perf_counter() - time_before_gfs)}")
+        # print(f"gfs time: {1e3*(perf_counter() - time_before_gfs)}")
 
         # if the fantasies are at the same points, we need to expand the inputs for the new model
         if tbdim == ibdim + 1:

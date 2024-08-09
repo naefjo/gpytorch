@@ -246,11 +246,16 @@ class ExactGP(GP):
         self.train_inputs = None
         self.train_targets = None
         self.likelihood = None
+        # Clear hooks to avoid them being copied
+        self._load_state_dict_pre_hooks.clear()
         new_model = deepcopy(self)
         self.prediction_strategy = old_pred_strat
         self.train_inputs = old_train_inputs
         self.train_targets = old_train_targets
         self.likelihood = old_likelihood
+
+        # Clear hooks in the new model to remove any lingering references to the old model
+        new_model._load_state_dict_pre_hooks.clear()
 
         new_likelihood = old_likelihood.get_fantasy_likelihood(**fantasy_kwargs)
         new_model.likelihood = new_likelihood
